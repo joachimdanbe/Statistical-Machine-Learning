@@ -1,0 +1,607 @@
+---
+title: " African Institute for Mathematical Sciences (AIMS)- Rwanda .\\ Assignment 2 Statistical Machine Leaning"
+author: "Joachim SINYABE DANBE"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: false
+    fig_width: 15
+    fig_height: 7
+ontsize: 12pt
+classoption: oneside
+header-includes:
+  - \usepackage{float}
+  - \usepackage{placeins}
+  - \raggedbottom
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.pos ="H", results  = "hide", warning = FALSE, message = FALSE, fig.align = 'center', out.width = "70%")
+```
+
+
+
+## Exercice 1: Practical SML on DNA Microarrays
+```{r }
+library(ggplot2)
+library(dplyr)
+```
+
+```{r }
+prostate <- read.csv('/home/guest/Desktop/JSD/SML/Dataset/prostate-cancer-1.csv')
+prostate$Y <- as.factor(prostate$Y)
+head(prostate)
+str(prostate)
+summary(prostate$Y)
+```
+
+```{r}
+n <- nrow(prostate)
+p<-ncol(prostate) - 1 #without the response variable
+cat("Sample size n : ", n, "\n")
+cat("Number of predictors p : ", p, "\n")
+cat("Kappa  n/p : ", round(n/p, 2), "\n")
+```
+## 1. 
+The dataset exhibits the classic "**large p, small n**" problem ubiquitous in genomic studies. With **`r p` predictors** but only **`r n` samples**, we have a **n/p ratio of `r round(n/p, 2)`**, indicating extreme dimensionality. This creates a **curse of dimensionality** 
+
+
+## 2. 
+we are in high-dimensional \( \kappa = 0.16 \) with potential multidisciplinary. This means \(n \ll p\) and overfitting is an serious risk for flexible models like trees and kNN. Thus regularisation or feature selection selection is crucial.
+
+## 3. Response Distribution
+
+
+```{r fig-1, fig.cap= ": Distribution of response"}
+ggplot(prostate, aes(x=Y))+
+  geom_bar(fill = "steelblue")+
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.3)+
+  labs(x = "Y (class)", y= "Count")
+prop.table(table(prostate$Y))
+
+```
+
+We have 37 observations in class 0(non-cacer) and 42 in class 1 (cancer), so the classes are fairly balanced \(46.83\% \text{ and } 53.16 \%\). This is good for us because test error and ROC curves will be more meaningful;
+
+## 4. Kruskal–Wallis ranking and top 9 variables
+```{r}
+predictors_names <- setdiff(names(prostate), "Y")
+
+kw_stats<-sapply(predictors_names, function(v){
+  kruskal.test(prostate[[v]]~prostate$Y)$statistic
+})
+
+kw_df <- data.frame(
+  variable = predictors_names,
+  KW<- as.numeric(kw_stats)
+)%>% arrange(desc(KW))
+
+head(kw_df, 9)
+top9<- kw_df$variable[1:9]
+
+```
+THese are the top 9 predictors according to Kruskal-Wallis test, the first is \(X217844\_at\)
+```{r ig-2, fig.cap= ": Top 9 predictors according to Kruskal-Wallis test"}
+library(ggplot2)
+
+kw_df1 <- data.frame(
+  variable = names(kw_stats),
+  KW = unname(kw_stats),
+  stringsAsFactors = FALSE
+) %>% 
+  arrange(desc(KW))
+
+top9_df <- kw_df1 %>% slice(1:9)
+
+ggplot(top9_df, aes(x = reorder(variable, KW), y = KW)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(KW, 2)), 
+            hjust = -0.1, 
+            size = 4) +
+  coord_flip() +
+  labs(
+    title = "",
+    x = "Variables",
+    y = "Kruskal-Wallis's Statistic"
+  ) +
+  theme_minimal() +
+  expand_limits(y = max(top9_df$KW) * 1.1)
+
+```
+
+
+## 5. Kruskal-Wallis Plot
+
+
+```{r fig-3, fig.cap= ": Univariate gene ranking (Kruskal–Wallis)"}
+ggplot(kw_df, aes(x = reorder(variable, -KW), y = KW)) +
+  geom_segment(aes(xend = variable, y = 0, yend = KW),
+               linewidth = 0.8, color = "grey70") +
+  geom_point(size = 2.5, color = "#2C7FB8") +
+  labs(x = "Gene", y = "Kruskal–Wallis statistic",
+       title = "") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+
+We observe from this type= ’h’ plot  a small subset of genes with signicantly higher Krustkal-Wallis values, indicating strong univariate associations with cancer status. Most genes show low values, suggesting limited individual predictive power.
+
+## 6. Boxplots of top 9 variables
+```{r fig-4, fig.cap= ": Top 9 genes vs response"}
+prostate_long_top<-prostate %>%
+  select(all_of(c("Y", top9)))%>%
+  tidyr::pivot_longer(-Y, names_to = "variable", values_to = "value")
+
+ggplot(prostate_long_top, aes(x=Y, y = value, fill = Y))+
+  geom_boxplot(outlier.size = 0.5)+
+  facet_wrap(~variable, scales = "free_y")+
+  theme_bw()+
+  labs(title= "", x="Y", y = "Expression")
+```
+We observe clear differences in the expression between classes 0 and 1. For most genes, the median expression levels are shifted and the interquartile ranges have limited overlap, indicating strong univariate association with the response and fgood potential to discriminate cancer from non-cancer subjects.
+
+## 7. Classification Tree with cp=0.01
+
+```{r  fig-5, fig.cap= ": Classification Tree (cp=0.01)"}
+library(rpart)
+library(rpart.plot)
+tree.xy<- rpart(Y~., data = prostate, control = rpart.control(cp =0.01))
+rpart.plot(tree.xy, main =" ")
+```
+We have $4$ terminal nodes and $7$ total nodes is 
+**Mathematical Regions:**
+
+**Region 2:** the left internal node under the root
+\[
+R_2 = \{ x = (X201290\_at, X209048\_at)^T \;\text{s.t.}\;
+        X201290\_at \ge 1.1,\; X209048\_at \ge -0.29 \}.
+\]
+**Region 4:** :
+\[
+R_4 = \{ x = (X201290\_at, X209048\_at)^T \;\text{such that}\;
+        X201290\_at < 1.1,\; X209048\_at < -0.063 \}.
+\]
+
+$X201290\_at$ (ranked 4th in Kruskal-Wallis test) was selected as the root split. This demonstrates good agreement between univariate ranking and the the CART algorithm's impurity minimization. However, CART considers global impurity reduction while Krusk-Wallis only measures marginal effects ,
+
+## 8. Comparative Boxplots: 9 Weakest Genes
+
+```{r fig-6, fig.cap= ": 9 weakest genes vs response"}
+#8-9 Weakest variable.
+weak9 <- kw_df$variable[(nrow(kw_df)-8):nrow(kw_df)]
+
+prostate_long_weak <- prostate %>%
+  select(all_of(c("Y", weak9)))%>%
+  tidyr::pivot_longer(-Y, names_to = "variable", values_to = "value")
+
+ggplot(prostate_long_weak, aes(x=Y, y = value, fill = Y))+
+  geom_boxplot(outlier.size = 0.5)+
+  facet_wrap(~variable, scales = "free_y")+
+  theme_bw()+
+  labs(title = "", x="Y", y="Expression")
+```
+
+We remark :
+
+-Near-complete overlap of boxplots between classes;
+-Similr medians and spreads
+-No consistent expression patterns
+-These genes carry essentially no discrimitative signal
+
+So feature selection is crucial to remove such noisy variables
+
+
+## 9. Correlation Matrix
+
+```{r fig-7, fig.cap= ": Correlation matrix of gene expression"}
+library(corrplot)
+
+library(corrplot)
+
+X <- prostate[ , setdiff(names(prostate), "Y")]
+cor_data <- cor(X, use = "pairwise.complete.obs")
+
+corrplot(cor_data, 
+         method = "color",
+         type = "upper",
+         order = "hclust",
+         tl.col = "black",
+         tl.cex = 0.4,
+         tl.srt = 45,
+         col = colorRampPalette(c("#3498DB", "white", "#E74C3C"))(200),
+         title = "",
+         mar = c(0,0,2,0),
+         cl.cex = 0.8)
+
+```
+
+The clustered correlation shows large red blocks of very strong correlations, indicating that many genes are tightly co-expressed and highly redundant. The block structure reveals distinct gene modules with high within-block correlations, consistent maybe with co-regulated biological pathways. 
+
+correlation are mostly positive, suggesting that genes tend to co-express rather than regulate each other antagonisticaly . The stong multicollinearity cofirm the effective dimensionality much lower than the num ber of genes, so dimension reduction (PCA) and regularized models are preferable to naive methods taht assume independent predictors.
+
+# 10.  Eigendecomposition 
+
+```{r}
+ev<- eigen(cor_data)
+lambda_max <- max(ev$values)
+lambda_min <- min(ev$values)
+lambda_ratio <- lambda_max/lambda_min
+lambda_ratio
+```
+
+```{r}
+# Remove the response variable for correlation matrix
+X <- prostate[, -which(names(prostate) == "Y")]
+
+# Compute correlation matrix
+cor_matrix <- cor(X)
+
+# Eigen decomposition
+eigen_decomp <- eigen(cor_matrix)
+lambda_max <- max(eigen_decomp$values)
+lambda_min <- min(eigen_decomp$values)
+ratio <- lambda_max / lambda_min
+
+# Output
+cat("λ_max:", lambda_max, "\n")
+cat("λ_min:", lambda_min, "\n")
+cat("λ_max / λ_min:", ratio, "\n")
+```
+
+
+\(\lambda_{\max}/\lambda_{\min}\) is very large \(5.48\times 10^{15}\) shows that the correlation matrice is strongly ill-conditioned: variance is concetrated along a few principal directions, while some directions carry almost no variance. This mean that the predictor space is highly anisotropic and that many linear combination of genes are nearly redundant.
+ 
+
+# 11. ROC Curves (Full Data as Train/Test)
+
+```{r fig-8, fig.cap= ": ROC curves (train = test)"}
+library(class)
+#install.packages("ROCR")
+library(ROCR)
+
+set.seed(1)
+Xmat <- as.matrix(X)
+Y <- prostate$Y
+# distance-based KNN needs scaling
+X_scaled <- scale(Xmat)
+
+
+pos_level <- levels(Y)[2]
+
+prob_knn <- function(k) {
+  pred <- knn(train = X_scaled, test = X_scaled,
+              cl = Y, k = k, prob = TRUE)
+
+  # posterior prob of the predicted (winning) class
+  p_win <- attr(pred, "prob")
+
+
+  p <- ifelse(pred == pos_level, p_win, 1 - p_win)
+  return(p)
+}
+
+p1 <- prob_knn(1)
+p7 <- prob_knn(7)
+p9 <- prob_knn(9)
+
+#rees with cp = 0, 0.05, 0.1
+
+tree_cp0 <- rpart(Y ~ ., data = prostate, control = rpart.control(cp = 0))
+
+tree_cp005 <- rpart(Y ~ ., data = prostate, control = rpart.control(cp = 0.05))
+
+tree_cp01 <- rpart(Y ~ ., data = prostate, control = rpart.control(cp = 0.1))
+
+p_t0 <- predict(tree_cp0, type = "prob")[, 2]
+p_t005 <- predict(tree_cp005, type = "prob")[, 2]
+p_t01 <- predict(tree_cp01, type = "prob")[, 2]
+
+#ROC curves
+
+pred1 <- prediction(p1, Y)
+pred7 <- prediction(p7, Y)
+pred9 <- prediction(p9, Y)
+pred_t0 <- prediction(p_t0, Y)
+pred_t005 <- prediction(p_t005, Y)
+pred_t01 <- prediction(p_t01, Y)
+
+perf1 <- performance(pred1, "tpr", "fpr")
+perf7 <- performance(pred7, "tpr", "fpr")
+perf9 <- performance(pred9, "tpr", "fpr")
+perf_t0 <- performance(pred_t0, "tpr", "fpr")
+perf_t005 <- performance(pred_t005, "tpr", "fpr")
+perf_t01 <- performance(pred_t01, "tpr", "fpr")
+
+plot(perf1, col = "black", main = "")
+plot(perf7, add = TRUE, col = "blue")
+plot(perf9, add = TRUE, col = "red")
+plot(perf_t0, add = TRUE, col = "darkgreen")
+plot(perf_t005, add = TRUE, col = "orange")
+plot(perf_t01, add = TRUE, col = "purple")
+abline(0, 1, lty = 2)
+legend("bottomright",
+legend = c("1NN","7NN","9NN","Tree cp=0","Tree cp=0.05","Tree cp=0.1"),
+col = c("black","blue","red","darkgreen","orange","purple"), lwd = 2, cex = 0.7)
+
+
+
+```
+
+## 12
+```{r fig-9, fig.cap= ": Tree with different cp"}
+prp(tree_cp0,   main = "Tree cp = 0")
+prp(tree_cp005, main = "Tree cp = 0.05")
+prp(tree_cp01,  main = "Tree cp = 0.1")
+
+```
+
+## 13. ROC Curve Interpretation
+-All models show near-perfect classification $(AUC \approx 1)$
+
+-1NN achieves $100\%$ training accuracy
+-Unpruned trees $(cp = 0)$ achieve near-perfect separation
+
+This was expected in high-dimensional settings $(p \gg n)$ because :
+
+- flexible models can memorize the training data
+- each observation can be its own nearest neighbor in 1NN
+- Trees can grow until terminal nodes are pure
+- Models have enough capacity to perfectly separate training data
+
+These ROC curves curves optimistic bias and say little about generalization ability. Proper validation (train test splits or cross-validation) is essential.
+
+
+
+# 14. Repeated Holdout Analysis (S=100)
+
+```{r }
+set.seed(19671210)
+S <- 100
+errs <- data.frame(
+split = integer(),
+model = factor(),
+error = numeric()
+)
+
+for (s in 1:S) {
+idx <- sample(1:n, size = floor(0.7 * n))
+train <- prostate[idx, ]
+test <- prostate[-idx, ]
+
+Xtr <- scale(as.matrix(train[, predictors_names]))
+Xte <- scale(as.matrix(test[, predictors_names]),
+center = attr(Xtr, "scaled:center"),
+scale = attr(Xtr, "scaled:scale"))
+Ytr <- train$Y
+Yte <- test$Y
+
+
+#kNN predictions
+
+pred_knn <- function(k) {
+pred <- knn(train = Xtr, test = Xte, cl = Ytr, k = k)
+mean(pred != Yte)
+}
+
+e1 <- pred_knn(1)
+e7 <- pred_knn(7)
+e9 <- pred_knn(9)
+trees
+
+fit0 <- rpart(Y ~ ., data = train, control = rpart.control(cp = 0))
+fit005 <- rpart(Y ~ ., data = train, control = rpart.control(cp = 0.05))
+fit01 <- rpart(Y ~ ., data = train, control = rpart.control(cp = 0.1))
+
+pt0 <- predict(fit0, newdata = test, type = "class")
+pt005 <- predict(fit005, newdata = test, type = "class")
+pt01 <- predict(fit01, newdata = test, type = "class")
+
+e_t0 <- mean(pt0 != Yte)
+e_t005 <- mean(pt005 != Yte)
+e_t01 <- mean(pt01 != Yte)
+
+errs <- rbind(
+errs,
+data.frame(split = s, model = "1NN", error = e1),
+data.frame(split = s, model = "7NN", error = e7),
+data.frame(split = s, model = "9NN", error = e9),
+data.frame(split = s, model = "Tree cp=0", error = e_t0),
+data.frame(split = s, model = "Tree cp=0.05",error = e_t005),
+data.frame(split = s, model = "Tree cp=0.1", error = e_t01)
+)
+}
+
+errs$model <- factor(errs$model)
+```
+
+```{r fig-10, fig.cap= ": Test error over 100 random splits"}
+ggplot(errs, aes(x = model, y = error, fill = model)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(title = "",
+       x = "Model", y = "Test error")
+
+```
+- 1NN, 7NN, 9NN show a similar error distributions
+- Trees with $cp = 0$ has a higher median error than kNN
+- Trees with $cp=0.05, 0.1$ have highest errors 
+In term of complexity relationship, we can say model complexity doesn't guarantee better test performance in high-dimensional settings
+
+```{r}
+aov_fit <- aov(error ~ model, data = errs)
+summary(aov_fit)
+TukeyHSD(aov_fit)
+```
+
+According to Tukey HSD test, only the heavily pruned tree $(cp = 0.1)$ has a significantly higher test error that \((p = 0.017)\) and 9NN \((p = 0.0016)\), while the different kNN models and the trees with \(cp = 0\) and \(cp = 0.05\) do not differ significantly; overall, this suggests that the pruned trees perform worse than the kNN models on this dataset.
+
+
+# 15. General Observations ans lessons
+
+Form this analysis we note that 
+
+- In High-dimensional challenge \(n \ll p\) (kappa about \(0.16\)), traditional modeling approaches struggle without regularization or feature selection.  
+
+- A small subset of genes has strong discriminative power, while most genes contribute mainly noise rather than signal, so feature selection is crucial.  
+
+- Strong block correlations suggest underlying biological pathways and high redundancy, which reduces the effective dimensionality and make multicollinearity a concern.  
+
+- Training performance can be nearly perfect (AUC \(\approx 1\)) due to overfitting, whereas test performance reveals true generalization; in this setting, relatively simple models (such as kNN) can outperform more complex ones.  
+
+- The gap between train and test performance is large, so internal validation (holdout or cross‑validation) is essential, and ROC curves computed only on training data are misleading.  
+-So in  high-dimensional case one should always use proper validation, perform feature selection before modeling, apply regularization or dimension reduction, start with simple models before exploring more complex ones, and be aware of multicollinearity in biological data.  
+
+**Theoretical implications.**  
+The exploration illustrates bias–variance trade‑off in high dimensions: highly flexible models can achieve almost zero training errors but often generalize poorly. The effective dimensionality of the gene‑expression space is much lower than the nominal \(p = 500\), which supports using methods that explicitly exploit this structure, such as sparse models, principal component analysis, and regularized learners.
+
+
+## Exercise 2 ; Nearest Neighbors as a Kernel Method
+
+Consider\(Y \in \{-1,+1\}\) a binary response and use the \(k\)-Nearest Neighbours learning machine.  
+Recognizing that the weight \(w_i(x)\) is a decreasing function of the distance (dissimilarity) between \(x\) and \(x_i\), we reinterpret \(w_i(x)\) as a similarity measure between \(x\) and \(x_i\).  
+Using a bivariate kernel function \(\mathcal{K} : \mathcal{X} \times \mathcal{X} \to \mathbb{R}_+\), we adopt the negative exponential weighting scheme:
+\[
+\mathcal{K}(x,x_i) = w_i(x)
+ = \frac{\exp\bigl(-\gamma d(x,x_i)\bigr)}
+        {\sum_{l} \exp\bigl(-\gamma d(x,x_l)\bigr)},
+\]
+where \(\gamma > 0\) is a bandwidth parameter.  
+Let \(\alpha_i = \mathbf{1}\{x_i \in \mathcal{V}_k(x)\}\) be the neighborhood indicator, where \(\mathcal{V}_k(x) \subseteq \mathcal{D} \subset \mathcal{X}\) denotes the set of \(k\) nearest neighbours of \(x\).
+
+
+## 1. 
+\(\hat f_{kNN}(x)\) gives the predicted label because for a query point \(\mathbf{x}\), the kernel weights
+\(K(\mathbf{x},\mathbf{x}_i)\) are non‑negative and sum to 1, so
+\(\sum_i y_i \alpha_i K(\mathbf{x},\mathbf{x}_i)\) is a weighted
+average of neighbor labels \(-1\) and \(+1\).
+If the average is positive, there is more total weight on neighbors
+with label \(+1\); if it is negative, there is more weight on neighbors
+with label \(-1\), so taking the sign returns the majority class and
+therefore a predicted label in \(\{-1,+1\}\).
+
+
+
+
+## 2. 
+\(\hat\pi(\mathbf{x}) = \sum_{i=1}^n \mathbf{1}(y_i = 1)\alpha_i
+K(\mathbf{x},\mathbf{x}_i)\) is the kernel‑weighted proportion of
+neighbors with label \(+1\).
+Under standard k‑NN assumptions, its  estimates the conditional
+class probability \(\pi(\mathbf{x}) = P(Y=1\mid X=\mathbf{x})\)
+
+
+
+## 3. Relationship between \(\hat f_{kNN}(x)\) and \(\hat g_{kNN}(x)\)
+
+Because labels are \(\{-1,+1\}\), class \(+1\) corresponds to
+\(\pi(\mathbf{x})>1/2\) and class \(-1\) to \(\pi(\mathbf{x})\le 1/2\).
+The function \(\hat g_{kNN}(x)=2\,\mathbf{1}(\hat\pi(\mathbf{x})>1/2)-1\)
+returns \(+1\) or \(-1\) using this probability threshold, and this is
+equivalent to taking the sign of the centered probability, so
+\(\hat g_{kNN}(x)\) and \(\hat f_{kNN}(x)\) implement the same
+classification rule.
+
+
+## 4. 
+\(\mathcal{Y} = \{0,1\}\) since the function space
+\(\mathcal{H} = \{ f : \mathcal{X} \rightarrow \mathcal{Y} \, | \,
+f(\mathbf{x}) = \mathbf{1}(\hat\pi(\mathbf{x})>1/2)\}\)
+uses indicator outputs.
+Each function in \(\mathcal{H}\) maps inputs \(\mathbf{x}\) to 0 for the
+negative class and 1 for the positive class.
+
+## 5. Another hypothesis space in similar form
+
+Another common hypothesis space defined via an estimated probability is
+the set of logistic‑regression classifiers,
+\[
+\mathcal{H}_{\text{logit}}
+= \left\{ f_\beta : \mathcal{X}\to\{0,1\} \,\middle|\,
+f_\beta(\mathbf{x}) = \mathbf{1}\big(\sigma(\beta^\top \mathbf{x})>1/2\big) \right\},
+\]
+where \(\sigma(t)\) is the logistic function and
+\(\sigma(\beta^\top \mathbf{x})\) estimates \(P(Y=1\mid X=\mathbf{x})\)
+for some parameter vector \(\beta\).
+Like the k‑NN rule, this space consists of decision functions that
+threshold an estimated conditional class probability at \(1/2\).
+
+
+
+# Bonus Exercise: Understanding of Training vs Test
+
+
+Given a dataset $\mathcal{D} = \{Z_1, Z_2, \ldots, Z_n\}$ 
+Let $m = |\mathcal{D}_{\text{TR}}|$ and $s = |\mathcal{D}_{\text{TE}}|$.\\
+And
+$$\hat{R}_{\text{TR}}(f) = \frac{1}{m} \sum_{i=1}^{n} \ell(Y_i, f(X_i)) \mathbf{1}(Z_i \in \mathcal{D}_{\text{TR}})$$
+$$\hat{R}_{\text{TE}}(f) = \frac{1}{s} \sum_{j=1}^{n} \ell(Y_j, f(X_j)) \mathbf{1}(Z_j \in \mathcal{D}_{\text{TE}})$$
+
+$$ \hat{f} = \arg\min_{f \in \mathcal{H}}\{\hat{R}_{\text{TR}}(f)\} $$
+
+$$ \tilde{f} = \arg\min_{f \in \mathcal{H}}\{\hat{R}_{\text{TE}}(f)\} $$
+
+Let's show that $\mathbb{E}(\hat{R}_{\text{TR}}(\hat{f})) \leq \mathbb{E}(\hat{R}_{\text{TE}}(\hat{f}))$, where $\hat{f}$ is the empirical risk minimizer on the training set.
+
+Now that : 
+
+$$ \hat{f} = \arg\min_{f \in \mathcal{H}}\{\hat{R}_{\text{TR}}(f)\} \quad \text{and} \quad \tilde{f} = \arg\min_{f \in \mathcal{H}}\{\hat{R}_{\text{TE}}(f)\} $$
+
+$$A = \hat{R}_{\text{TR}}(\hat{f}) = \frac{1}{m} \sum_{i=1}^{n} \ell(Y_i, \hat{f}(X_i)) \mathbf{1}(Z_i \in \mathcal{D}_{\text{TR}}) \,\quad B = \hat{R}_{\text{TE}}(\hat{f}) = \frac{1}{s} \sum_{j=1}^{n} \ell(Y_j, \hat{f}(X_j)) \mathbf{1}(Z_j \in \mathcal{D}_{\text{TE}})$$
+
+$$C = \hat{R}_{\text{TR}}(\tilde{f}) = \frac{1}{m} \sum_{i=1}^{n} \ell(Y_i, \tilde{f}(X_i)) \mathbf{1}(Z_i \in \mathcal{D}_{\text{TR}}) \, \quad D = \hat{R}_{\text{TE}}(\tilde{f}) = \frac{1}{s} \sum_{j=1}^{n} \ell(Y_j, \tilde{f}(X_j)) \mathbf{1}(Z_j \in \mathcal{D}_{\text{TE}})$$
+
+
+Here \(A\) is the training error of \(\hat{f}\), \(B\) its test error, \(C\) the training
+error of \(\tilde{f}\), and \(D\) its the test error.
+
+We know as the split into train and test is completely symmetric: each \(Z_i\) is i.i.d., and any
+subset of the right size can be th training or the test set. Since the training on one part and
+testing on the other (giving \(B\)) has the same distribution as training on the other
+part and testing on the first (giving \(C\)). Therefore
+\[
+\mathbb{E}(B) = \mathbb{E}(C).
+\]
+
+For the same symmetry reason as the previous, the best possible training error on the training set
+and on the test set have the same distributions. In other words, the distributions of
+\(\min_{f\in\mathcal{H}} \hat{R}_{\text{TR}}(f) = A\) and
+\(\min_{f\in\mathcal{H}} \hat{R}_{\text{TE}}(f) = D\) are the same, so
+\[
+\mathbb{E}(A) = \mathbb{E}(D).
+\]
+
+By definition,
+\[
+\tilde{f} = \arg\min_{f \in \mathcal{H}} \hat{R}_{\text{TE}}(f),
+\]
+so for every \(f \in \mathcal{H}\),
+\[
+\hat{R}_{\text{TE}}(\tilde{f}) \le \hat{R}_{\text{TE}}(f).
+\]
+In particular, for \(f = \hat{f}\),
+\[
+D = \hat{R}_{\text{TE}}(\tilde{f}) \le \hat{R}_{\text{TE}}(\hat{f}) = B,
+\]
+and taking expectations gives
+\[
+\mathbb{E}(D) \le \mathbb{E}(B).
+\]
+
+Putting everything together,
+\[
+\mathbb{E}(A) = \mathbb{E}(D) \le \mathbb{E}(B) = \mathbb{E}(C).
+\]
+Since \(A = \hat{R}_{\text{TR}}(\hat{f})\) and \(B = \hat{R}_{\text{TE}}(\hat{f})\), we obtain
+\[
+\mathbb{E}\big[\hat{R}_{\text{TR}}(\hat{f})\big]
+\le
+\mathbb{E}\big[\hat{R}_{\text{TE}}(\hat{f})\big],
+\]
+which is the desired inequality.

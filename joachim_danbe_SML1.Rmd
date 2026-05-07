@@ -1,0 +1,1184 @@
+---
+title: "SML Assigment"
+author: "Joachim SINYABE DANBE"
+date: "2025-12-06"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+    keep_tex: true
+---
+
+
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+``` 
+
+#Llet's load CMAPSS data
+```{r}
+#Dataset : NASA C-MAPSS (Commercial Modular Aero-Propulsion System Simulation)
+#Source : \url{https://www.kaggle.com/datasets/palbha/cmapss-jet-engine-simulated-data
+
+col_names <- c("engine_id", "cycle", "op_setting_1", "op_setting_2", "op_setting_3", paste0("sensor_", 1:21))
+
+load_cmapss <- function(file_path) {
+  read.table(file_path, col.names = col_names
+  ) %>%arrange(engine_id, cycle)
+}
+
+
+path ="/home/guest/Desktop/JSD/SML/Dataset/"
+
+train_raw <- load_cmapss(paste0(path, "train_FD001.txt"))
+test_raw  <- load_cmapss(paste0(path, "test_FD001.txt"))
+rul_actual   <- read.table(paste0(path, "RUL_FD001.txt"), header = FALSE)
+
+colnames(rul_actual) <- "RUL"
+
+colnames(test_raw)  <- col_names
+colnames(rul_actual)   <- "RUL"
+```
+
+
+
+#Wheel 1 # Formulation problem
+
+#Wheel 2 # Data explonatory
+
+# We add RUL to training data and for test data we add just the last observation
+```{r}
+head(train_raw)
+head(test_raw)
+head(rul_actual)
+train_raw <- train_raw %>%
+    group_by(engine_id) %>%
+    mutate(
+      max_cycle = max(cycle),
+      rul = max_cycle - cycle
+    ) %>%
+    ungroup() %>%
+    select(-max_cycle)
+test_raw <- test_raw %>%
+    group_by(engine_id) %>%
+    filter(cycle == max(cycle)) %>%
+    ungroup() %>%
+    bind_cols(rul_actual)
+```
+
+#The informations about the data set are  
+
+```{r}
+cat("Train:", nrow(train_raw), "observations,",
+n_distinct(train_raw$engine_id), "engines\n")
+cat("Test:", nrow(test_raw), "observations,",
+n_distinct(test_raw$engine_id), "engines\n")
+cat("Mean RUL:", round(mean(train_raw$rul), 1), "cycles\n\n")
+
+```
+
+#RUL Distribution
+
+```{r}
+library(ggplot2)
+#install.packages("gridExtra")
+library(gridExtra)
+
+p1 <- ggplot(train_raw, aes(x = rul)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  labs(title = "Distribution of RUL (Training Set)",
+       x = "RUL (cycles)", 
+       y = "Frequency")
+
+p2 <- train_raw %>%
+  group_by(engine_id) %>%
+  summarise(max_rul = max(rul), .groups = "drop") %>%
+  ggplot(aes(x = max_rul)) +
+  geom_histogram(bins = 30, fill = "coral", alpha = 0.7) +
+  labs(title = "Distribution of Engine Lifetimes",
+       x = "Total Lifetime (cycles)", 
+       y = "Count")
+
+grid.arrange(p1, p2, ncol = 2)
+
+```
+# Descriptives statistics of key sensors
+
+```{r}
+train_raw %>%
+  select(rul, sensor_2, sensor_4, sensor_11, sensor_7, sensor_21) %>%
+  summary() %>%
+  knitr::kable(caption = "Descriptive Statistics of Key Variables")
+
+```
+
+# constant sensor and Correlation matrix
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+sensor_variance <- train_raw %>%select(starts_with("sensor_")) %>%summarise(across(everything(),
+      ~ var(.x, na.rm = TRUE)
+    )
+  ) %>%pivot_longer(everything(),
+    names_to = "sensor",
+    values_to = "variance"
+  ) %>%arrange(variance)
+
+# constant with sensors (variance < 0.001)
+constant_sensors <- sensor_variance %>%
+  dplyr::filter(variance < 0.001) %>%
+  dplyr::pull(sensor)
+
+cat("Constant sensors to remove:", paste(constant_sensors, collapse = ", "), "\n")
+cat("Number of sensors to remove:", length(constant_sensors), "\n")
+
+# variance table
+sensor_variance %>%
+  dplyr::mutate(variance = round(variance, 4)) %>%
+  head(10) %>%
+  knitr::kable(caption = "Sensor Variance (Top 10 Lowest)")
+
+```
+
+
+
+
+```{r}
+train_raw %>%
+  filter(engine_id %in% 1:5) %>%
+  ggplot(aes(x = cycle, y = rul, color = as.factor(engine_id))) +
+  geom_line(size = 1, alpha = 0.8) +
+  labs(title = "RUL Trajectories for 5 Engines",
+       x = "Cycle", 
+       y = "RUL (cycles remaining)",
+       color = "Engine ID") +
+  theme_minimal()
+```
+
+
+#Wheel 3: Feature Engineering & Model Specification
+
+
+```{r}
+add_features <- function(df) {
+  df %>%
+    dplyr::group_by(engine_id) %>%
+    dplyr::arrange(cycle) %>%
+    dplyr::mutate(
+      sensor_2_roll_mean = zoo::rollmean(sensor_2, k = 5, fill = NA, align = "right"),
+      sensor_4_roll_mean = zoo::rollmean(sensor_4, k = 5, fill = NA, align = "right"),
+      sensor_11_roll_mean = zoo::rollmean(sensor_11, k = 5, fill = NA, align = "right")
+    ) %>%
+    dplyr::ungroup()
+}
+
+
+train_fe <- add_features(train_raw) %>%
+  select(-all_of(constant_sensors))  # Remove constant sensors
+
+cat("Features after engineering:", ncol(train_fe) - 3, "\n")  # -3 for id, cycle, rul
+cat("Observations after removing NA:", nrow(train_fe), "\n")
+
+colnames(train_fe)
+
+```
+
+# Visualization of Feature Engineering Impact
+
+```{r}
+train_fe %>%
+  dplyr::filter(engine_id == 1) %>%
+  dplyr::select(cycle, sensor_2, sensor_2_roll_mean) %>%
+  tidyr::pivot_longer(-cycle, names_to = "feature", values_to = "value") %>%
+  ggplot2::ggplot(aes(x = cycle, y = value, color = feature)) +
+  ggplot2::geom_line(size = 0.8, alpha = 0.8) +
+  ggplot2::labs(
+    title = "Feature Engineering: Sensor 2 (Engine #1)",
+    x = "Cycle", y = "Value", color = "Feature"
+  ) +
+  ggplot2::theme_minimal()
+
+```
+
+
+#Wheel 4 Loss function 
+
+**Mean Squared Error (MSE)**:
+$$L(y, \hat{y}) = (y - \hat{y})^2$$
+
+
+**Empirical Risk**:
+$$R_{\text{emp}}(\theta) = \frac{1}{n}\sum_{i=1}^{n}(y_i - f_\theta(\mathbf{x}_i))^2$$
+
+**Evaluation Metric**: RMSE = $\sqrt{\text{MSE}}$
+
+```{r}
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted))
+}
+
+r2_score <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+}
+```
+
+
+
+#Wheel 5 : Learning  criteria & Optimisation
+##Train/VAlidation split
+
+```{r}
+unique_engines <- unique(train_fe$engine_id)
+n_train_engines <- floor(0.8 * length(unique_engines))
+
+train_engine_ids <- sample(unique_engines, n_train_engines)
+val_engine_ids <- setdiff(unique_engines, train_engine_ids)
+
+
+train_data <- train_fe %>% filter(engine_id %in% train_engine_ids)
+val_data <- train_fe %>% filter(engine_id %in% val_engine_ids)
+
+
+X_train <- train_data %>% 
+  select(-engine_id, -cycle, -rul) %>%
+  as.data.frame()
+y_train <- train_data$rul
+
+X_val <- val_data %>% 
+  select(-engine_id, -cycle, -rul) %>%
+  as.data.frame()
+y_val <- val_data$rul
+
+cat("Training set:", nrow(X_train), "observations\n")
+cat("Validation set:", nrow(X_val), "observations\n")
+cat("Number of features:", ncol(X_train), "\n")
+```
+```{r}
+
+na_count_train <- sum(is.na(X_train))
+na_count_val <- sum(is.na(X_val))
+
+if (na_count_train > 0) {
+  cat("Warning: NA values in training data:", na_count_train, "\n")
+  X_train <- na.omit(X_train)
+  y_train <- y_train[complete.cases(train_data %>% select(-engine_id, -cycle, -rul))]
+}
+
+if (na_count_val > 0) {
+  cat("Warning: NA values in validation data:", na_count_val, "\n")
+  X_val <- na.omit(X_val)
+  y_val <- y_val[complete.cases(val_data %>% select(-engine_id, -cycle, -rul))]
+}
+
+# Check for infinite values
+if (any(!is.finite(as.matrix(X_train)))) {
+  cat("Warning: Infinite values detected in training data\n")
+  X_train <- X_train %>% mutate(across(everything(), ~replace(., !is.finite(.), NA))) %>% na.omit()
+}
+
+cat("\nFinal dimensions:\n")
+cat("  X_train:", nrow(X_train), "×", ncol(X_train), "\n")
+cat("  X_val:", nrow(X_val), "×", ncol(X_val), "\n\n")
+```
+
+### Model 1:  Linear  Regression
+
+```{r}
+library(caret)
+
+cat("Training Linear Regression...\n")
+model_lm <- lm(y_train ~ ., data = X_train)
+
+#predictions 
+pred_lm_train <- predict(model_lm, X_train)
+pred_lm_val <- predict(model_lm, X_val)
+
+
+# Metrics
+rmse_lm_train <- rmse(y_train, pred_lm_train)
+rmse_lm_val <- rmse(y_val, pred_lm_val)
+r2_lm_val <- r2_score(y_val, pred_lm_val)
+
+
+cat("Linear Regression Results:\n")
+cat("  Features used:", ncol(X_train), "\n")
+cat("  RMSE (train):", round(rmse_lm_train, 2), "\n")
+cat("  RMSE (val):", round(rmse_lm_val, 2), "\n")
+cat("  R² (val):", round(r2_lm_val, 3), "\n\n")
+
+```
+# wheel 6 : Regularisation 
+## Model 2: Ridge Regression
+
+```{r}
+#install.packages("glmnet")
+library(glmnet)
+
+cat("Training Ridge Regression with CV...\n")
+
+X_train_matrix <- as.matrix(X_train)
+X_val_matrix <- as.matrix(X_val)
+
+set.seed(123)
+cv_ridge <- cv.glmnet(X_train_matrix, y_train, alpha = 0, nfolds = 5)
+
+lambda_opt <- cv_ridge$lambda.min
+
+# Train with optimal lambda
+model_ridge <- glmnet(X_train_matrix, y_train, alpha = 0, lambda = lambda_opt)
+
+# Predictions
+pred_ridge_train <- predict(model_ridge, X_train_matrix)[,1]
+pred_ridge_val <- predict(model_ridge, X_val_matrix)[,1]
+
+# Metrics
+rmse_ridge_train <- rmse(y_train, pred_ridge_train)
+rmse_ridge_val <- rmse(y_val, pred_ridge_val)
+r2_ridge_val <- r2_score(y_val, pred_ridge_val)
+
+cat("Ridge Regression Results:\n")
+cat("  Optimal \\lamdda:", round(lambda_opt, 4), "\n")
+cat("  RMSE (train):", round(rmse_ridge_train, 2), "\n")
+cat("  RMSE (val):", round(rmse_ridge_val, 2), "\n")
+cat("  R² (val):", round(r2_ridge_val, 3), "\n\n")
+
+```
+
+
+
+#Visualisation : Lambda Selection (Ridge)
+```{r}
+plot(cv_ridge, main = "")
+abline(v = log(lambda_opt), col = "red", lty = 2, lwd = 2)
+```
+## Model 3: Random Forest
+```{r}
+library(randomForest)
+
+cat("Training Random Forest...\n")
+
+set.seed(456)
+model_rf <- randomForest(x = X_train, y = y_train, ntree = 500, mtry = floor(sqrt(ncol(X_train))), maxnodes = 50,importance = TRUE, nodesize = 5 )
+
+# Predictions
+pred_rf_train <- predict(model_rf, X_train)
+
+pred_rf_val <- predict(model_rf, X_val)
+
+# Metrics
+rmse_rf_train <- rmse(y_train, pred_rf_train)
+rmse_rf_val <- rmse(y_val, pred_rf_val)
+r2_rf_val <- r2_score(y_val, pred_rf_val)
+
+cat("Random Forest Results:\n")
+cat("  RMSE (train):", round(rmse_rf_train, 2), "\n")
+cat("  RMSE (val):", round(rmse_rf_val, 2), "\n")
+cat("  R² (val):", round(r2_rf_val, 3), "\n\n")
+
+```
+# top 15 features importants in random Forest
+```{r}
+importance_df <- importance(model_rf) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("feature") %>%
+  dplyr::arrange(dplyr::desc(`%IncMSE`)) %>%
+  head(15)
+
+ggplot(importance_df, aes(x = reorder(feature, `%IncMSE`), y = `%IncMSE`)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Top 15 Feature Importance (Random Forest)",
+       x = "Feature",
+       y = "% Increase in MSE when permuted") +
+  theme_minimal()
+```
+
+
+
+# Wheel 7: Extrinsic Predictive Comparisons
+## Comparison Table
+```{r model_xgboost}
+
+results <- tibble(
+  Model = c("Baseline (Mean)", "Linear Regression", "Ridge", 
+            "Random Forest"),
+  RMSE_Train = c(
+    rmse(y_train, rep(mean(y_train), length(y_train))),
+    rmse_lm_train,
+    rmse_ridge_train,
+    rmse_rf_train
+  ),
+  RMSE_Val = c(
+    rmse(y_val, rep(mean(y_train), length(y_val))),
+    rmse_lm_val,
+    rmse_ridge_val,
+    rmse_rf_val
+  ),
+  R2_Val = c(
+    0,
+    r2_lm_val,
+    r2_ridge_val,
+    r2_rf_val
+  ),
+  MAE_Val = c(
+    mae(y_val, rep(mean(y_train), length(y_val))),
+    mae(y_val, pred_lm_val),
+    mae(y_val, pred_ridge_val),
+    mae(y_val, pred_rf_val)
+  )
+) %>%
+  mutate(
+    RMSE_Train = round(RMSE_Train, 2),
+    RMSE_Val = round(RMSE_Val, 2),
+    R2_Val = round(R2_Val, 3)
+  )
+
+knitr::kable(results, 
+             caption = "Model Comparison on Validation Set",
+             align = "lcccc")
+
+
+best_model_idx <- which.min(results$RMSE_Val[-1]) + 1  # Exclude baseline
+best_model_name <- results$Model[best_model_idx]
+cat("\nBest performing model:", best_model_name, 
+    "(RMSE =", results$RMSE_Val[best_model_idx], ")\n")
+
+```
+# visualisation of Model Performance Comparison
+```{r}
+results %>%
+  select(Model, RMSE_Val, MAE_Val) %>%
+  pivot_longer(-Model, names_to = "Metric", values_to = "Value") %>%
+  ggplot(aes(x = reorder(Model, -Value), y = Value, fill = Metric)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Model Performance Comparison",
+       x = "Model",
+       y = "Error",
+       fill = "Metric") +
+  theme_minimal()
+```
+
+### Predictions vs Actual (RandomForest)
+
+```{r}
+#  When we se Random Forest predictions (typically best among the 3)
+
+pred_df <- tibble(
+  actual = y_val,
+  predicted = pred_rf_val,
+  error = actual - predicted
+)
+
+p1 <- ggplot(pred_df, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Predictions vs Actual (RandomForest)",
+       x = "Actual RUL",
+       y = "Predicted RUL") +
+  theme_minimal()
+
+p2 <- ggplot(pred_df, aes(x = error)) +
+  geom_histogram(bins = 40, fill = "coral", alpha = 0.7) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Prediction Error Distribution",
+       x = "Error (Actual - Predicted)",
+       y = "Frequency") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+## Wheel 8: Statistical Inference & Theoretical Justification
+
+## Bootstrap Confidence Intervals
+
+```{r}
+cat("Computing Bootstrap Confidence Intervals (B=1000)...\n")
+
+set.seed(999)
+B <- 1000
+bootstrap_rmse <- numeric(B)
+bootstrap_r2 <- numeric(B)
+
+for (b in 1:B) {
+  idx <- sample(length(y_val), replace = TRUE)
+  bootstrap_rmse[b] <- rmse(y_val[idx], pred_rf_val[idx])
+  bootstrap_r2[b] <- r2_score(y_val[idx], pred_rf_val[idx])
+}
+
+# Calculate confidence intervals
+ci_rmse_lower <- quantile(bootstrap_rmse, 0.025)
+ci_rmse_upper <- quantile(bootstrap_rmse, 0.975)
+ci_r2_lower <- quantile(bootstrap_r2, 0.025)
+ci_r2_upper <- quantile(bootstrap_r2, 0.975)
+
+cat("\nBootstrap 95% Confidence Intervals (RandomForest):\n")
+cat("  RMSE:", round(rmse_rf_val, 2), 
+    "  [", round(ci_rmse_lower, 2), ",", round(ci_rmse_upper, 2), "]\n")
+cat("  R²:", round(r2_rf_val, 3), 
+    "  [", round(ci_r2_lower, 3), ",", round(ci_r2_upper, 3), "]\n\n")
+
+```
+
+
+#Bootstrap Distribution
+```{r vis11_bootstrap, fig.height=4}
+boot_df <- tibble(
+  RMSE = bootstrap_rmse,
+  R2 = bootstrap_r2
+)
+
+p1 <- ggplot(boot_df, aes(x = RMSE)) +
+  geom_histogram(bins = 40, fill = "skyblue", alpha = 0.7) +
+  geom_vline(xintercept = rmse_rf_val, color = "red", size = 1) +
+  geom_vline(xintercept = ci_rmse_lower, color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = ci_rmse_upper, color = "blue", linetype = "dashed") +
+  labs(title = "Bootstrap RMSE Distribution",
+       x = "RMSE",
+       y = "Frequency",
+       caption = "Red: observed | Blue: 95% CI") +
+  theme_minimal()
+
+p2 <- ggplot(boot_df, aes(x = R2)) +
+  geom_histogram(bins = 40, fill = "lightgreen", alpha = 0.7) +
+  geom_vline(xintercept = r2_rf_val, color = "red", size = 1) +
+  geom_vline(xintercept = ci_r2_lower, color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = ci_r2_upper, color = "blue", linetype = "dashed") +
+  labs(title = "Bootstrap R² Distribution",
+       x = "R²",
+       y = "Frequency") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+
+## Statistical Significance Test
+
+```{r wilcoxon_test}
+errors_lm <- abs(y_val - pred_lm_val)
+errors_rf <- abs(y_val - pred_rf_val)
+
+test_result <- wilcox.test(errors_lm, errors_rf, paired = TRUE)
+
+cat("Wilcoxon Signed-Rank Test (XGBoost vs Random Forest):\n")
+cat("  Null hypothesis: No difference in prediction errors\n")
+cat("  p-value:", format.pval(test_result$p.value, digits = 3), "\n")
+cat("  Conclusion:", 
+    ifelse(test_result$p.value < 0.05, 
+           "RandomForests significantly better (p < 0.05)",
+           "No significant difference (p > =  0.05)"), 
+    "\n\n")
+```
+## Theoretical Justification
+```{r}
+d_vc <- 500  # Approximate for ensemble of trees
+n <- nrow(X_train)
+delta <- 0.05
+
+bound_term <- sqrt((d_vc * log(2*n/d_vc) + log(4/delta)) / n)
+r_true_upper <- rmse_rf_val + bound_term
+
+cat("Generalization Bound (with 95% probability):\n")
+cat("  Empirical RMSE:", round(rmse_rf_val, 2), "\n")
+cat("  Bound term:", round(bound_term, 2), "\n")
+cat("  True RMSE <= ", round(r_true_upper, 2), "\n\n")
+```
+
+# Wheel 9: Deployment & Practical Scalability
+
+```{r}
+
+example_engine_id <- val_engine_ids[1]
+
+example_indices <- which(val_data$engine_id == example_engine_id)
+
+pred_example <- pred_rf_val[example_indices]
+actual_example <- y_val[example_indices]
+cycles_example <- val_data$cycle[example_indices]
+
+std_error <- sd(y_val - pred_rf_val)
+ci_width <- 1.96 * std_error
+
+pred_df_example <- tibble(
+  cycle = cycles_example,
+  rul_actual = actual_example,
+  rul_predicted = pred_example,
+  ci_lower = pred_example - ci_width,
+  ci_upper = pred_example + ci_width
+) %>%arrange(cycle)
+
+cat("Deployment Example (Engine", example_engine_id, "):\n")
+cat("  Total observations:", nrow(pred_df_example), "\n")
+cat("  Cycle range:", min(cycles_example), "-", max(cycles_example), "\n")
+cat("  Final predicted RUL:", round(tail(pred_example, 1), 1), "\n")
+cat("  Final actual RUL:", round(tail(actual_example, 1), 1), "\n")
+cat("  Absolute error:", round(abs(tail(pred_example, 1) - tail(actual_example, 1)), 1), "cycles\n\n")
+
+```
+
+### Visualization : Deployment Example with CI
+
+```{r vis11_deployment, fig.height=5}
+ggplot(pred_df_example, aes(x = cycle)) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), 
+              fill = "lightblue", alpha = 0.4) +
+  geom_line(aes(y = rul_actual, color = "Actual"), size = 1.2) +
+  geom_line(aes(y = rul_predicted, color = "Predicted"), size = 1.2) +
+  labs(title = paste("JSD: Engine", example_engine_id),
+       subtitle = "RUL Prediction with 95% Confidence Interval",
+       x = "Cycle",
+       y = "RUL (cycles)",
+       color = "Type") +
+  theme_minimal() +
+  scale_color_manual(values = c("Actual" = "coral", "Predicted" = "steelblue"))
+
+```
+
+## Data Drift Monitoring
+
+```{r drift_monitoring}
+train_sensor_mean <- mean(train_data$sensor_2, na.rm = TRUE)
+val_sensor_mean <- mean(val_data$sensor_2, na.rm = TRUE)
+
+drift_pct <- abs(val_sensor_mean - train_sensor_mean) / train_sensor_mean * 100
+
+cat("Data Drift Monitoring:\n")
+cat("  Sensor 2 mean (train):", round(train_sensor_mean, 2), "\n")
+cat("  Sensor 2 mean (val):", round(val_sensor_mean, 2), "\n")
+cat("  Drift percentage:", round(drift_pct, 2), "%\n")
+cat("  Alert threshold: 5%\n")
+cat("  Status:", ifelse(drift_pct > 5, " ALERT - Retraining needed", 
+                        "OK - No significant drift"), "\n\n")
+
+```
+
+
+
+
+
+
+#Exercise 2 : Practical Machine Learning - Digit Recogni-tion
+
+```{r}
+library(dslabs)
+library(class)    
+library(caret)     
+library(pROC)     
+library(ggplot2)
+```
+
+
+#Data exploratoration
+
+
+```{r}
+mnist <- read_mnist()
+
+set.seed(19671210)
+
+# we keep only digits 1 and 7
+idx_train <- which(mnist$train$labels %in% c(1, 7))
+idx_test  <- which(mnist$test$labels  %in% c(1, 7))
+
+xtrain <- mnist$train$images[idx_train, ]
+ytrain <- factor(mnist$train$labels[idx_train], levels = c(1, 7))
+xtest  <- mnist$test$images[idx_test, ]
+ytest  <- factor(mnist$test$labels[idx_test], levels = c(1, 7))
+
+
+n_train <- nrow(xtrain)
+n_test <- nrow(xtest)
+p_feat  <- ncol(xtrain)
+
+cat("Usefull informations\n")
+cat("Training sample size (n):", n_train, "\n")
+cat("Test sample size:", n_test, "\n")
+cat("Feature dimensionality (p):", p_feat, "\n")
+#cat("Ratio n/p:", round(n_train/p_feat, 3), "\n\n")
+
+```
+#Train k‑NN models (k = 1 and k = 27)
+
+
+```{r}
+library(ggplot2)
+library(caret)
+
+# 1NN confusion matrix plot
+cm1 <- as.data.frame(conf_1nn$table)
+colnames(cm1) <- c("True", "Predicted", "Freq")
+
+ggplot(cm1, aes(x = Predicted, y = True, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 5) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix - 1NN (k = 1)",
+       x = "Predicted class",
+       y = "True class") +
+  theme_minimal()
+
+# 27NN confusion matrix plot
+cm27 <- as.data.frame(conf_27nn$table)
+colnames(cm27) <- c("True", "Predicted", "Freq")
+
+ggplot(cm27, aes(x = Predicted, y = True, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 5) +
+  scale_fill_gradient(low = "white", high = "darkred") +
+  labs(title = "Confusion Matrix - 27NN (k = 27)",
+       x = "Predicted class",
+       y = "True class") +
+  theme_minimal()
+
+
+cat("=== PERFORMANCE EVALUATION ===\n\n")
+
+# 1NN Performance
+cat("1NN (k = 1) Results\n")
+conf_1nn <- confusionMatrix(pred_1nn, ytest, positive = "1")
+print(conf_1nn$table)
+cat("\nAccuracy:", round(conf_1nn$overall["Accuracy"], 4), "\n")
+cat("Sensitivity (True Positive Rate):", round(conf_1nn$byClass["Sensitivity"], 4), "\n")
+cat("Specificity (True Negative Rate):", round(conf_1nn$byClass["Specificity"], 4), "\n\n")
+
+# 27NN Performance
+cat("27NN (k = 27) Results\n")
+conf_27nn <- confusionMatrix(pred_27nn, ytest, positive = "1")
+print(conf_27nn$table)
+cat("\nAccuracy:", round(conf_27nn$overall["Accuracy"], 4), "\n")
+cat("Sensitivity (True Positive Rate):", round(conf_27nn$byClass["Sensitivity"], 4), "\n")
+cat("Specificity (True Negative Rate):", round(conf_27nn$byClass["Specificity"], 4), "\n\n")
+
+
+```
+
+#ROC curves and AUC
+
+```{r}
+set.seed(19671210)
+
+# train k-NN models via caret (gives class probabilities)
+knn1  <- knn3(x = xtrain, y = ytrain, k = 1)
+knn27 <- knn3(x = xtrain, y = ytrain, k = 27)
+
+# predicted probabilities for class "1"
+prob_1nn  <- predict(knn1,  xtest)[, "1"]
+prob_27nn <- predict(knn27, xtest)[, "1"] 
+roc_1nn  <- roc(response = ytest, predictor = prob_1nn,  levels = c("7", "1"))
+roc_27nn <- roc(response = ytest, predictor = prob_27nn, levels = c("7", "1"))
+
+auc_1nn  <- auc(roc_1nn)
+auc_27nn <- auc(roc_27nn)
+auc_1nn; auc_27nn
+
+plot(roc_1nn,  col = "blue",  main = "ROC curves: 1-NN vs 27-NN")
+plot(roc_27nn, col = "red", add = TRUE)
+legend("bottomright",
+       legend = c(paste0("1-NN  (AUC = ",  round(auc_1nn,  3), ")"),
+                  paste0("27-NN (AUC = ", round(auc_27nn, 3), ")")),
+       col = c("blue", "red"), lwd = 2)
+
+```
+
+#Error visualization: one FP and one FN
+
+
+```{r}
+# confusion for 27-NN to identify errors
+conf_1nn$table
+conf_27nn$table
+# logical vectors
+fp_idx <- which(pred_27nn == "1" & ytest == "7")
+fn_idx <- which(pred_27nn == "7" & ytest == "1")
+
+i_fp <- fp_idx[1]
+i_fn <- fn_idx[1]
+
+
+plot_digit <- function(x_vec, title = "") {
+  m <- matrix(as.numeric(x_vec), nrow = 28, byrow = TRUE)
+  image(t(apply(m, 2, rev)), col = gray(seq(0, 1, length = 256)),
+        axes = FALSE, main = title)
+}
+
+par(mfrow = c(1, 2))
+plot_digit(xtest[i_fp, ], title = "False Positive: predicted 1, true 7")
+par(mfrow = c(1, 1))
+
+```
+
+
+# Compare training vs test accuracy
+
+```{r}
+
+pred_1nn_train <- knn(train = xtrain, test = xtrain, cl = ytrain, k = 1)
+pred_27nn_train <- knn(train = xtrain, test = xtrain, cl = ytrain, k = 27)
+
+acc_1nn_train <- mean(pred_1nn_train == ytrain)
+acc_27nn_train <- mean(pred_27nn_train == ytrain)
+acc_1nn_test <- conf_1nn$overall['Accuracy']
+acc_27nn_test <- conf_27nn$overall['Accuracy']
+
+cat("\n1NN - Training Accuracy:", round(acc_1nn_train, 4), 
+    "| Test Accuracy:", round(acc_1nn_test, 4), "\n")
+cat("27NN - Training Accuracy:", round(acc_27nn_train, 4), 
+    "| Test Accuracy:", round(acc_27nn_test, 4), "\n\n")
+
+```
+
+# We end this study by summarize as the followinng 
+```{r}
+cat("\nSUMMARY\n")
+summary_df <- data.frame(
+  Model = c("1NN", "27NN"),
+  Accuracy = c(round(acc_1nn_test, 4), round(acc_27nn_test, 4)),
+  AUC = c(round(auc_1nn, 4), round(auc_27nn, 4)),
+  Sensitivity = c(round(conf_1nn$byClass['Sensitivity'], 4), 
+                  round(conf_27nn$byClass['Sensitivity'], 4)),
+  Specificity = c(round(conf_1nn$byClass['Specificity'], 4), 
+                  round(conf_27nn$byClass['Specificity'], 4))
+)
+print(summary_df)
+```
+
+
+
+
+
+
+
+
+
+#Exercise 3 : Discovering the concept of ultra high dimen-sionality
+
+```{r}
+# install.packages("mlbench")
+library(mlbench)
+library(corrplot)
+library(ggplot2)
+library(gridExtra)
+library(car)
+options(warn = -1)
+```
+
+```{r}
+
+
+path1 = "/home/guest/Desktop/JSD/SML/Dataset/"
+
+data("DNA")          
+data("BreastCancer") 
+
+#different data set
+spam      <- read.csv(paste0(path1, "spam-classification-1.csv"), header = TRUE)
+leukemia  <- read.csv(paste0(path1, "leukemia-data-1.csv"),       header = TRUE)
+prostate  <- read.csv(paste0(path1, "prostate-cancer-1.csv"),     header = TRUE)
+colon     <- read.csv(paste0(path1,"colon-cancer-1.csv"),        header = TRUE)
+
+
+```
+
+#let's define the main function that can take any data set and do all necessaries analysis
+```{r}
+options(warn = -1)
+
+analyze_dataset <- function(data, name, target_col = NULL, exclude_cols = NULL) {
+  cat("\n====================", name, "====================\n\n")
+  
+  if (!is.null(exclude_cols)) data <- data[, !(names(data) %in% exclude_cols)]
+  if (!is.null(target_col) && target_col %in% names(data)) {
+    target <- data[[target_col]]
+    data   <- data[, names(data) != target_col]
+    cat("Target:", target_col, "\n\n")
+  }
+  
+  
+  data_clean <- na.omit(data)
+  n <- nrow(data_clean); p <- ncol(data_clean); kappa <- n / p
+  
+  cat("1) Dimension\n")
+cat("   n =", n, ", p =", p, ", $\\kappa = n/p =", round(kappa, 4), "$\n")
+  if (kappa > 5)      cat("   → Classical: plenty of samples per variable\n\n")
+  else if (kappa>=1) cat("   → Moderate: regularization helpful\n\n")
+  else               cat("   → Ultra high-dimensional (p > n): strong regularization / feature selection needed\n\n")
+  
+  cat("2) Type and scale homogeneity\n")
+  types <- sapply(data_clean, function(x) class(x)[1])
+  print(table(types))
+  num_numeric <- sum(sapply(data_clean, is.numeric))
+  cat("   Numeric vars:", num_numeric, "\n")
+  if (length(unique(types)) == 1) cat("   → All features same type\n") else cat("   → Mixed feature types\n")
+  
+  
+  num_cols <- sapply(data_clean, is.numeric)
+  if (any(num_cols)) { 
+    num_data <- data_clean[, num_cols, drop = FALSE]
+    ranges <- sapply(num_data, function(x) diff(range(x, na.rm = TRUE)))
+    range_ratio <- max(ranges) / (min(ranges) + 1e-10)
+    cat("   Range ratio (max/min):", round(range_ratio, 2), "\n")
+    if (range_ratio < 10) cat("   → Scales broadly comparable\n\n") else cat("   → Scales very different (standardize)\n\n")
+  } else {
+    cat("   No numeric variables\n\n")
+  }
+  
+  cat("3) Graphical summaries (up to 9 vars)\n\n")
+  p_plot <- min(9, p)
+  set.seed(42)
+  sel <- if (p > 9) sample(1:p, 9) else 1:p
+  plots <- vector("list", p_plot)
+  for (i in seq_len(p_plot)) {
+    vname <- names(data_clean)[sel[i]]
+    vdat  <- data_clean[[sel[i]]]
+    df    <- data.frame(x = vdat)
+    if (is.numeric(vdat)) {
+      plots[[i]] <- ggplot(df, aes(x = x)) +
+        geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+        labs(title = vname, x = "", y = "Freq") +
+        theme_minimal(base_size = 9)
+    } else {
+      plots[[i]] <- ggplot(df, aes(x = x)) +
+        geom_bar(fill = "coral", color = "black") +
+        labs(title = vname, x = "", y = "Count") +
+        theme_minimal(base_size = 9) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    }
+  }
+  grid.arrange(grobs = plots, ncol = 3, top = paste(name, "- distributions"))
+  
+  cat("4) Correlations and multicollinearity\n\n")
+  num_cols <- sapply(data_clean, is.numeric)
+  if (sum(num_cols) > 1) {
+    num_data <- data_clean[, num_cols, drop = FALSE]
+    if (ncol(num_data) > 50) {
+      cat("   Using first 50 numeric variables for correlation analysis\n")
+      num_data <- num_data[, 1:50]
+    }
+    C <- cor(num_data, use = "pairwise.complete.obs")
+    high <- which(abs(C) > 0.7 & abs(C) < 1, arr.ind = TRUE)
+    cat("   Pairs with |r| > 0.7:", nrow(high) / 2, "\n")
+    if (nrow(high) > 0) {
+      cat("   → Strong multicollinearity present\n")
+      upper <- high[high[,1] < high[,2], , drop = FALSE]
+      vals  <- C[upper]
+      top   <- order(abs(vals), decreasing = TRUE)[1:min(5, length(vals))]
+      cat("   Top correlated pairs:\n")
+      for (k in top) {
+        i <- upper[k,1]; j <- upper[k,2]
+        cat("     ", colnames(C)[i], "<->", colnames(C)[j], 
+            ": r =", round(C[i,j], 3), "\n")
+      }
+    } else cat("   → No strong multicollinearity\n")
+    cat("\n")
+    
+    if (ncol(num_data) <= 20) {
+      corrplot(C, method = "color", type = "upper",
+               tl.cex = 0.7, tl.col = "black",
+               title = paste(name, "- correlation matrix"),
+               mar = c(0,0,2,0))
+    } else {
+      idx <- 1:20
+      corrplot(C[idx, idx], method = "color", type = "upper",
+               tl.cex = 0.7, tl.col = "black",
+               title = paste(name, "- correlation (first 20 vars)"),
+               mar = c(0,0,2,0))
+    }
+  } else {
+    cat("   Not enough numeric variables for correlations\n\n")
+  }
+}
+
+
+```
+
+#Apply on all the dataset
+```{r}
+
+data(DNA)
+analyze_dataset(DNA, "DNA", target_col = "Class")
+
+data(BreastCancer)
+analyze_dataset(BreastCancer, "BreastCancer",
+                target_col = "Class", exclude_cols = "Id")
+
+cat("\nSpam Classification\n")
+tryCatch({
+  spam <- read.csv(paste0(path1,"spam-classification-1.csv"))
+  analyze_dataset(spam, "Spam", target_col = names(spam)[ncol(spam)])
+}, error = function(e) cat("  File spam-classification-1.csv not found.\n"))
+
+cat("\nLeukemia\n")
+tryCatch({
+  leukemia <- read.csv(paste0(path1,"leukemia-data-1.csv"))
+  analyze_dataset(leukemia, "Leukemia", target_col = names(leukemia)[1])
+}, error = function(e) cat("  File leukemia-data-1.csv not found.\n"))
+
+cat("\nProstate cancer\n")
+tryCatch({
+  prostate <- read.csv(paste0(path1,"prostate-cancer-1.csv"))
+  analyze_dataset(prostate, "Prostate", target_col = names(prostate)[1])
+}, error = function(e) cat("  File prostate-cancer-1.csv not found.\n"))
+
+cat("\nColon cancer\n")
+tryCatch({
+  colon <- read.csv(paste0(path1,"colon-cancer-1.csv"))
+  analyze_dataset(colon, "Colon", target_col = names(colon)[1])
+}, error = function(e) cat("  File colon-cancer-1.csv not found.\n"))
+```
+
+
+#Exercise BOnus 
+#1)
+#2)
+
+
+```{r}
+set.seed(123)
+n <- 99
+
+X <- runif(n, 0, 2*pi)
+
+Y <- numeric(n)
+for(i in 1:n) {
+  mean_y <- (pi/2) * X[i] + (3*pi/4) * cos((pi/2) * (1 + X[i]))
+  sd_y <- pi / sqrt(18)
+  Y[i] <- rnorm(1, mean = mean_y, sd = sd_y)
+}
+
+cat("Toatl samples of (X_i, Y_i) : ", n, "\n\n")
+```
+
+#3 scatterplot
+
+```{r}
+plot(X, Y, 
+     main = "Scatterplot of Generated Data",
+     xlab = "X", 
+     ylab = "Y",
+     pch = 16, 
+     col = rgb(0, 0, 1, 0.5),
+     cex = 0.8)
+
+
+x_seq <- seq(0, 2*pi, length.out = 200)
+f_star <- (pi/2) * x_seq + (3*pi/4) * cos((pi/2) * (1 + x_seq))
+lines(x_seq, f_star, col = "red", lwd = 2)
+legend("topright", legend = c("Data", "True f*(X)"), 
+       col = c("blue", "red"), pch = c(16, NA), lty = c(NA, 1), lwd = c(NA, 2))
+```
+# Question 4a: Find f*(X)
+#Question 4b: Find R* (Bayes Risk)
+# Question 4c: Compare different regression methods
+
+```{r}
+train_size <- round(0.6 * n)
+train_idx <- sample(1:n, train_size)
+test_idx <- setdiff(1:n, train_idx)
+
+X_train <- X[train_idx]
+Y_train <- Y[train_idx]
+X_test <- X[test_idx]
+Y_test <- Y[test_idx]
+
+# we will replied n_rep
+n_rep <- 100
+test_errors <- matrix(NA, nrow = n_rep, ncol = 4)
+colnames(test_errors) <- c("kNN", "Linear", "Polynomial", "Tree")
+```
+
+
+```{r}
+
+# libraries
+if(!require(FNN)) install.packages("FNN", repos = "http://cran.rstudio.com/")
+if(!require(rpart)) install.packages("rpart", repos = "http://cran.rstudio.com/")
+library(FNN)
+library(rpart)
+```
+
+
+```{r}
+for(rep in 1:n_rep) {
+  # Generate new sample
+  X_new <- runif(n, 0, 2*pi)
+  Y_new <- numeric(n)
+  for(i in 1:n) {
+    mean_y <- (pi/2) * X_new[i] + (3*pi/4) * cos((pi/2) * (1 + X_new[i]))
+    sd_y <- pi / sqrt(18)
+    Y_new[i] <- rnorm(1, mean = mean_y, sd = sd_y)
+  }
+  
+  # Split
+  X_train_new <- X_new[train_idx]
+  Y_train_new <- Y_new[train_idx]
+  X_test_new <- X_new[test_idx]
+  Y_test_new <- Y_new[test_idx]
+  
+  # 1. kNN Regression (k=5)
+  pred_knn <- knn.reg(train = matrix(X_train_new), 
+                      test = matrix(X_test_new), 
+                      y = Y_train_new, 
+                      k = 5)$pred
+  test_errors[rep, 1] <- mean((Y_test_new - pred_knn)^2)
+  # 2. Linear Regression
+  model_linear <- lm(Y_train_new ~ X_train_new)
+  pred_linear <- predict(model_linear, newdata = data.frame(X_train_new = X_test_new))
+  test_errors[rep, 2] <- mean((Y_test_new - pred_linear)^2)
+  
+  # 3. Polynomial Regression (degree 5)
+  model_poly <- lm(Y_train_new ~ poly(X_train_new, degree = 5, raw = TRUE))
+  pred_poly <- predict(model_poly, newdata = data.frame(X_train_new = X_test_new))
+  test_errors[rep, 3] <- mean((Y_test_new - pred_poly)^2)
+  
+  # 4. Regression Tree
+  df_train <- data.frame(X = X_train_new, Y = Y_train_new)
+  df_test <- data.frame(X = X_test_new)
+  model_tree <- rpart(Y ~ X, data = df_train, control = rpart.control(cp = 0.01))
+  pred_tree <- predict(model_tree, newdata = df_test)
+  test_errors[rep, 4] <- mean((Y_test_new - pred_tree)^2)
+}
+```
+
+
+
+
+# comparative boxplots
+```{r}
+par(mar = c(5, 4, 4, 2) + 0.1)
+boxplot(test_errors, 
+        main = "Test Errors Comparison (100 Replications)",
+        ylab = "Mean Squared Error",
+        xlab = "Method",
+        col = c("lightblue", "lightgreen", "lightcoral", "lightyellow"),
+        las = 1)
+abline(h = pi^2/18, col = "red", lwd = 2, lty = 2)
+legend("topright", legend = "Bayes Risk R*", col = "red", lty = 2, lwd = 2)
+```
+
+# Question 4d: Comment on results
+
+```{r}
+cat("\nQuestion 4d: Commentary\n")
+cat("Average Test Errors:\n")
+print(colMeans(test_errors))
+cat("\nBayes Risk R* =", pi^2/18, "\n\n")
+
+```
+
+
+
+
